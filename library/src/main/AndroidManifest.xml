@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.dawn.log">
+
+    <!--
+        本库不主动声明权限，由使用方根据实际场景按需声明。
+        LLog 日志写入到应用私有目录，不需要额外存储权限。
+    -->
+
+</manifest>
