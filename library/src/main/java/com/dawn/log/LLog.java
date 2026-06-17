@@ -1,11 +1,6 @@
 package com.dawn.log;
 
 import android.content.Context;
-import android.os.Build;
-import android.os.Handler;
-import android.os.HandlerThread;
-import android.os.Looper;
-import android.os.Message;
 import android.text.TextUtils;
 import android.util.Log;
 
@@ -13,20 +8,15 @@ import org.json.JSONArray;
 import org.json.JSONException;
 import org.json.JSONObject;
 
-import java.io.BufferedWriter;
-import java.io.File;
-import java.io.FileOutputStream;
-import java.io.IOException;
-import java.io.OutputStreamWriter;
 import java.io.StringReader;
 import java.io.StringWriter;
+import java.io.File;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.Comparator;
 import java.util.Date;
 import java.util.List;
 import java.util.Locale;
+import java.util.concurrent.CopyOnWriteArrayList;
 
 import javax.xml.transform.OutputKeys;
 import javax.xml.transform.Source;
@@ -38,9 +28,23 @@ import javax.xml.transform.stream.StreamSource;
 /**
  * 日志工具类
  * <p>
- * 支持 Logcat 打印和文件写入，文件写入使用后台线程队列，不会阻塞主线程。
- * 日志文件按天生成，自动清理超过 7 天的日志文件。
+ * 支持 Logcat 打印 + 多通道日志输出（文件写入、腾讯云 CLS 上传等）。
+ * 通过 {@link #addChannel(ILogChannel)} 可注册自定义通道，所有日志自动分发到各通道。
  * </p>
+ *
+ * <pre>
+ * // 仅本地文件（向后兼容）
+ * LLog.init(context, true, "MyApp");
+ *
+ * // 本地文件 + 腾讯云 CLS 双通道
+ * CLSConfig clsConfig = new CLSConfig.Builder()
+ *     .endpoint("ap-guangzhou.cls.tencentcs.com")
+ *     .secretId("your-secret-id")
+ *     .secretKey("your-secret-key")
+ *     .topicId("your-topic-id")
+ *     .build();
+ * LLog.init(context, true, "MyApp", clsConfig);
+ * </pre>
  */
 @SuppressWarnings("unused")
 public class LLog {
@@ -67,123 +71,135 @@ public class LLog {
 
     private static final int JSON_INDENT = 4;
     private static final int MAX_LOG_LENGTH = 4000;
-    private static final long MAX_FILE_SIZE = 10 * 1024 * 1024; // 单个文件最大 10MB
-    private static final int RETENTION_DAYS = 7; // 日志保留天数
 
-    private static final String PATTERN_DATE = "yyyy-MM-dd";
-    private static final String PATTERN_DATETIME = "yyyy-MM-dd HH:mm:ss.SSS";
-    private static final String LOG_FILE_PREFIX = "log_";
-    private static final String LOG_FILE_SUFFIX = ".txt";
+    // ==================== 通道管理 ====================
 
-    private static String logPath = null;
+    /** 已注册的日志输出通道（线程安全） */
+    private static final CopyOnWriteArrayList<ILogChannel> channels = new CopyOnWriteArrayList<>();
 
-    // 后台写入线程
-    private static HandlerThread writerThread;
-    private static Handler writerHandler;
+    /** 文件通道引用，用于文件管理操作 */
+    private static FileLogChannel fileChannel;
 
-    private static final int MSG_WRITE = 1;
-    private static final int MSG_FLUSH = 2;
+    /** 是否已初始化 */
+    private static boolean initialized = false;
 
-    // 当前打开的写入流（复用，避免频繁开关文件）
-    private static BufferedWriter currentWriter;
-    private static String currentFileName;
+    private static final SimpleDateFormat dateTimeFormat =
+            new SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.getDefault());
 
     private LLog() { }
 
     // ==================== 初始化 ====================
 
     /**
-     * 初始化日志
+     * 初始化日志（仅本地文件通道，向后兼容）
      *
      * @param context 上下文
      * @param isDebug 是否打印 Logcat 日志
      * @param tag     默认 TAG
      */
     public static void init(Context context, boolean isDebug, String tag) {
-        init(context, isDebug, tag, null);
+        init(context, isDebug, tag, (String) null);
     }
 
     /**
-     * 初始化日志
+     * 初始化日志（本地文件通道 + 自定义路径）
      *
-     * @param context 上下文
-     * @param isDebug 是否打印 Logcat 日志
-     * @param tag     默认 TAG
+     * @param context       上下文
+     * @param isDebug       是否打印 Logcat 日志
+     * @param tag           默认 TAG
      * @param customLogPath 自定义日志路径，为空则使用默认路径
      */
     public static void init(Context context, boolean isDebug, String tag, String customLogPath) {
+        if (initialized) return;
+
         TAG = tag;
         LOG_DEBUG = isDebug;
 
-        if (TextUtils.isEmpty(customLogPath)) {
-            logPath = getDefaultLogPath(context);
-        } else {
-            logPath = customLogPath;
-            if (!logPath.endsWith("/")) {
-                logPath += "/";
-            }
+        // 注册文件通道
+        fileChannel = new FileLogChannel(customLogPath);
+        fileChannel.init(context);
+        channels.add(fileChannel);
+
+        initialized = true;
+    }
+
+    // ==================== 腾讯云 CLS 初始化 ====================
+
+    /**
+     * 初始化日志（本地文件 + 腾讯云 CLS 双通道）
+     *
+     * @param context   上下文
+     * @param isDebug   是否打印 Logcat 日志
+     * @param tag       默认 TAG
+     * @param clsConfig 腾讯云 CLS 配置，为空则不启用 CLS
+     */
+    public static void init(Context context, boolean isDebug, String tag, CLSConfig clsConfig) {
+        init(context, isDebug, tag, (String) null);
+
+        if (clsConfig != null && clsConfig.isValid()) {
+            ILogChannel clsChannel = new CLSLogChannel(clsConfig);
+            clsChannel.init(context);
+            channels.add(clsChannel);
         }
+    }
 
-        // 确保目录存在
-        File dir = new File(logPath);
-        if (!dir.exists()) {
-            dir.mkdirs();
-        }
+    // ==================== 注册/移除通道 ====================
 
-        // 启动后台写入线程
-        startWriterThread();
-
-        // 在后台线程清理过期日志
-        if (writerHandler != null) {
-            writerHandler.post(new Runnable() {
-                @Override
-                public void run() {
-                    cleanExpiredLogs();
-                }
-            });
+    /**
+     * 注册自定义日志通道
+     *
+     * @param channel 自定义通道实现
+     */
+    public static void addChannel(ILogChannel channel) {
+        if (channel != null && !channels.contains(channel)) {
+            channels.add(channel);
         }
     }
 
     /**
-     * 释放资源（应用退出时调用）
+     * 移除日志通道
+     *
+     * @param channel 要移除的通道
+     */
+    public static void removeChannel(ILogChannel channel) {
+        if (channel != null) {
+            channel.release();
+            channels.remove(channel);
+        }
+    }
+
+    /**
+     * 释放所有资源（应用退出时调用）
      */
     public static void release() {
-        if (writerHandler != null) {
-            writerHandler.post(new Runnable() {
-                @Override
-                public void run() {
-                    closeCurrentWriter();
-                }
-            });
-            writerHandler.removeCallbacksAndMessages(null);
-            writerHandler = null;
+        for (ILogChannel channel : channels) {
+            channel.release();
         }
-        if (writerThread != null) {
-            writerThread.quitSafely();
-            writerThread = null;
-        }
+        channels.clear();
+        fileChannel = null;
+        initialized = false;
     }
 
     // ==================== 日志打印接口 ====================
 
     public static void v(String msg) {
         printLog(VERBOSE, TAG, msg);
-        writeLog(CHAR_VERBOSE, TAG, msg);
+        dispatchToChannels(CHAR_VERBOSE, TAG, msg);
     }
 
     public static void v(String tag, String msg) {
         printLog(VERBOSE, tag, msg);
-        writeLog(CHAR_VERBOSE, tag, msg);
+        dispatchToChannels(CHAR_VERBOSE, tag, msg);
     }
 
     public static void d(String msg) {
         printLog(DEBUG, TAG, msg);
-        writeLog(CHAR_DEBUG, TAG, msg);
+        dispatchToChannels(CHAR_DEBUG, TAG, msg);
     }
 
     public static void d(String tag, String msg) {
         printLog(DEBUG, tag, msg);
-        writeLog(CHAR_DEBUG, tag, msg);
+        dispatchToChannels(CHAR_DEBUG, tag, msg);
     }
 
     public static void i(Object... msg) {
@@ -194,39 +210,39 @@ public class LLog {
         }
         String str = sb.toString();
         printLog(INFO, TAG, str);
-        writeLog(CHAR_INFO, TAG, str);
+        dispatchToChannels(CHAR_INFO, TAG, str);
     }
 
     public static void w(String msg) {
         printLog(WARN, TAG, msg);
-        writeLog(CHAR_WARN, TAG, msg);
+        dispatchToChannels(CHAR_WARN, TAG, msg);
     }
 
     public static void w(String tag, String msg) {
         printLog(WARN, tag, msg);
-        writeLog(CHAR_WARN, tag, msg);
+        dispatchToChannels(CHAR_WARN, tag, msg);
     }
 
     public static void e(String msg) {
         printLog(ERROR, TAG, msg);
-        writeLog(CHAR_ERROR, TAG, msg);
+        dispatchToChannels(CHAR_ERROR, TAG, msg);
     }
 
     public static void e(String tag, String msg) {
         printLog(ERROR, tag, msg);
-        writeLog(CHAR_ERROR, tag, msg);
+        dispatchToChannels(CHAR_ERROR, tag, msg);
     }
 
     public static void e(String msg, Throwable tr) {
         String errorStr = buildErrorMsg(msg, tr);
         printLog(ERROR, TAG, errorStr);
-        writeLog(CHAR_ERROR, TAG, errorStr);
+        dispatchToChannels(CHAR_ERROR, TAG, errorStr);
     }
 
     public static void e(String tag, String msg, Throwable tr) {
         String errorStr = buildErrorMsg(msg, tr);
         printLog(ERROR, tag, errorStr);
-        writeLog(CHAR_ERROR, tag, errorStr);
+        dispatchToChannels(CHAR_ERROR, tag, errorStr);
     }
 
     public static void json(String json) {
@@ -251,7 +267,7 @@ public class LLog {
      * 获取日志文件存储目录
      */
     public static String getLogPath() {
-        return logPath;
+        return fileChannel != null ? fileChannel.getLogPath() : null;
     }
 
     /**
@@ -260,41 +276,15 @@ public class LLog {
      * @return 日志文件列表，如果没有日志文件则返回空列表
      */
     public static List<File> getLogFiles() {
-        List<File> result = new ArrayList<>();
-        if (logPath == null) return result;
-
-        File dir = new File(logPath);
-        if (!dir.exists() || !dir.isDirectory()) return result;
-
-        File[] files = dir.listFiles(file ->
-                file.isFile()
-                        && file.getName().startsWith(LOG_FILE_PREFIX)
-                        && file.getName().endsWith(LOG_FILE_SUFFIX));
-
-        if (files == null || files.length == 0) return result;
-
-        Arrays.sort(files, Comparator.comparingLong(File::lastModified));
-        result.addAll(Arrays.asList(files));
-        return result;
+        return fileChannel != null ? fileChannel.getLogFiles() : new ArrayList<File>();
     }
 
     /**
      * 手动清理过期日志文件
      */
     public static void cleanExpiredLogs() {
-        if (logPath == null) return;
-
-        File dir = new File(logPath);
-        if (!dir.exists() || !dir.isDirectory()) return;
-
-        File[] files = dir.listFiles();
-        if (files == null) return;
-
-        long expireTime = System.currentTimeMillis() - (long) RETENTION_DAYS * 24 * 60 * 60 * 1000;
-        for (File file : files) {
-            if (file.isFile() && file.lastModified() < expireTime) {
-                file.delete();
-            }
+        if (fileChannel != null) {
+            fileChannel.cleanExpiredLogs();
         }
     }
 
@@ -302,99 +292,28 @@ public class LLog {
      * 清除所有日志文件
      */
     public static void clearAllLogs() {
-        if (logPath == null) return;
-
-        // 先关闭当前写入流
-        if (writerHandler != null) {
-            writerHandler.post(new Runnable() {
-                @Override
-                public void run() {
-                    closeCurrentWriter();
-                    File dir = new File(logPath);
-                    if (dir.exists() && dir.isDirectory()) {
-                        File[] files = dir.listFiles();
-                        if (files != null) {
-                            for (File file : files) {
-                                file.delete();
-                            }
-                        }
-                    }
-                }
-            });
+        if (fileChannel != null) {
+            fileChannel.clearAllLogs();
         }
     }
 
-    // ==================== 后台写入实现 ====================
+    // ==================== 通道分发 ====================
 
-    private static void startWriterThread() {
-        if (writerThread != null && writerThread.isAlive()) return;
+    /**
+     * 将日志分发到所有已注册的通道
+     */
+    private static void dispatchToChannels(char level, String tag, String msg) {
+        if (channels.isEmpty()) return;
 
-        writerThread = new HandlerThread("LLog-Writer");
-        writerThread.start();
-        writerHandler = new Handler(writerThread.getLooper()) {
-            @Override
-            public void handleMessage(Message msg) {
-                if (msg.what == MSG_WRITE && msg.obj instanceof String) {
-                    doWriteToFile((String) msg.obj);
-                }
-            }
-        };
-    }
-
-    private static void writeLog(char level, String tag, String msg) {
-        if (logPath == null || writerHandler == null) return;
-
-        // 在调用线程组装日志行，减少后台线程工作
         String caller = getCallerInfo();
-        String timestamp = getDateTimeFormat().format(new Date());
-        String logLine = timestamp + " " + level + "/" + tag + " " + caller + " " + msg + "\n";
+        long timestamp = System.currentTimeMillis();
 
-        Message message = writerHandler.obtainMessage(MSG_WRITE, logLine);
-        writerHandler.sendMessage(message);
-    }
-
-    private static void doWriteToFile(String logLine) {
-        String fileName = getFileName(new Date());
-
-        try {
-            // 如果文件名变了（跨天）或者写入流未打开，重新打开
-            if (currentWriter == null || !fileName.equals(currentFileName)) {
-                closeCurrentWriter();
-                currentFileName = fileName;
-
-                File file = new File(fileName);
-                // 文件超过上限则截断重建
-                if (file.exists() && file.length() > MAX_FILE_SIZE) {
-                    file.delete();
-                }
-
-                File parentDir = file.getParentFile();
-                if (parentDir != null && !parentDir.exists()) {
-                    parentDir.mkdirs();
-                }
-
-                FileOutputStream fos = new FileOutputStream(fileName, true);
-                currentWriter = new BufferedWriter(new OutputStreamWriter(fos, "UTF-8"));
-            }
-
-            currentWriter.write(logLine);
-            currentWriter.flush();
-
-        } catch (IOException e) {
-            Log.e(TAG, "Failed to write log to file", e);
-            closeCurrentWriter();
-        }
-    }
-
-    private static void closeCurrentWriter() {
-        if (currentWriter != null) {
+        for (ILogChannel channel : channels) {
             try {
-                currentWriter.flush();
-                currentWriter.close();
-            } catch (IOException ignored) {
+                channel.write(level, tag, msg, caller, timestamp);
+            } catch (Exception e) {
+                Log.e(TAG, "Error dispatching log to channel: " + channel.getClass().getSimpleName(), e);
             }
-            currentWriter = null;
-            currentFileName = null;
         }
     }
 
@@ -507,20 +426,6 @@ public class LLog {
 
     // ==================== 工具方法 ====================
 
-    private static String getDefaultLogPath(Context context) {
-        if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.P) {
-            File externalDir = context.getExternalFilesDir(null);
-            if (externalDir != null) {
-                return externalDir.getAbsolutePath() + "/Logs/";
-            }
-        }
-        return context.getFilesDir().getAbsolutePath() + "/Logs/";
-    }
-
-    private static String getFileName(Date date) {
-        return logPath + LOG_FILE_PREFIX + getDateFormat().format(date) + LOG_FILE_SUFFIX;
-    }
-
     private static String getCallerInfo() {
         StackTraceElement[] stackTrace = Thread.currentThread().getStackTrace();
         // 回溯到调用方（跳过 getCallerInfo → writeLog/printLog → v/d/i/w/e → 用户调用）
@@ -545,13 +450,5 @@ public class LLog {
     private static String buildErrorMsg(String msg, Throwable tr) {
         if (tr == null) return msg;
         return msg + "\n" + Log.getStackTraceString(tr);
-    }
-
-    private static SimpleDateFormat getDateFormat() {
-        return new SimpleDateFormat(PATTERN_DATE, Locale.getDefault());
-    }
-
-    private static SimpleDateFormat getDateTimeFormat() {
-        return new SimpleDateFormat(PATTERN_DATETIME, Locale.getDefault());
     }
 }

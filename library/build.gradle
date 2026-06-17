@@ -40,4 +40,10 @@ afterEvaluate {
 
 dependencies {
     implementation 'androidx.appcompat:appcompat:1.6.1'
+
+    // 腾讯云日志服务 CLS Producer SDK
+    api 'com.tencentcloudapi.cls:tencentcloud-cls-sdk-android:1.0.13'
+
+    // CLS SDK 依赖 Guava ListenableFuture
+    api 'com.google.guava:guava:31.1-android'
 }
